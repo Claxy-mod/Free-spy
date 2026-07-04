@@ -15,6 +15,7 @@ from typing import Union, Any
 import logging
 from aiogram import Router, Bot, Dispatcher, F, types
 from aiogram.filters import Command
+from aiogram.exceptions import TelegramRetryAfter
 from html import escape
 from datetime import datetime, timezone, timedelta
 import pytz
@@ -66,6 +67,19 @@ def decrypt_text(encrypted_text: str) -> str:
     except Exception as e:
         logging.error(f"Failed to decrypt message: {e}")
         return "[Зашифрованное сообщение - Ошибка дешифрования]"
+
+
+async def safe_api_call(func, *args, **kwargs):
+    """Обертка для безопасного вызова методов API Telegram с защитой от FloodWait"""
+    try:
+        return await func(*args, **kwargs)
+    except TelegramRetryAfter as e:
+        logger.warning(f"FloodWait hit: sleeping for {e.retry_after}s before retrying.")
+        await asyncio.sleep(e.retry_after)
+        return await func(*args, **kwargs)
+    except Exception as e:
+        logger.error(f"API call failed: {e}")
+        raise
 
 TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
@@ -174,12 +188,19 @@ ALLOWED_COLUMNS = {
 
 
 def update_format(sql, parameters: dict) -> tuple[str, list]:
+    validated_params = []
     for key in parameters:
         if key not in ALLOWED_COLUMNS:
             raise ValueError(f"Unsanitized database column name detected: {key}")
-    values = ", ".join([f"{item} = {PLACEHOLDER}" for item in parameters])
+        validated_params.append((key, parameters[key]))
+    
+    if 'config' in globals() and hasattr(config, 'PLACEHOLDER'):
+        placeholder = getattr(config, 'PLACEHOLDER')
+    else:
+        placeholder = globals().get('PLACEHOLDER', '?')
+    values = ", ".join([f"{key} = {placeholder}" for key, _ in validated_params])
     sql += f" {values}"
-    return sql, list(parameters.values())
+    return sql, [value for _, value in validated_params]
 
 
 class MessageRecord(BaseModel):
@@ -298,13 +319,13 @@ class MessageStore:
         if file_ids:
             downloads_dir = os.path.join(BASE_DIR, "downloads")
             for fid in file_ids:
-                files = glob.glob(os.path.join(downloads_dir, f"{fid}.*"))
-                for f in files:
-                    try:
-                        os.remove(f)
-                        logger.info(f"Cleanup: deleted local file {f}")
-                    except Exception as e:
-                        logger.warning(f"Cleanup: failed to delete local file {f}: {e}")
+                local_path = os.path.join(downloads_dir, fid)
+                try:
+                    if os.path.exists(local_path):
+                        os.remove(local_path)
+                        logger.info(f"Cleanup: deleted local file {local_path}")
+                except Exception as e:
+                    logger.warning(f"Cleanup: failed to delete local file {local_path}: {e}")
 
 
 class ConnectionsDB:
@@ -523,12 +544,12 @@ async def cleanup_old_messages():
         await MessageStore.delete_old_messages(cutoff_timestamp_iso)
 
 
-BOT_VERSION = "1.7.0"
+BOT_VERSION = "1.8.0"
 CHANGELOG_TEXT = (
     f"📢 <b>Обновление бота (v{BOT_VERSION}):</b>\n\n"
-    "• <b>Безопасность на старте:</b> Бот больше не запустится с некорректным USER_ID или невалидным ENCRYPTION_KEY. Никаких автогенераций временных ключей и рисков утечек.\n"
-    "• <b>Пул соединений (Connection Pooling):</b> Оптимизирована работа с PostgreSQL (Supabase) — теперь бот использует пул соединений, что исключает ошибки перегрузки БД.\n"
-    "• <b>Улучшение кода:</b> Проведен глубокий рефакторинг отправки медиа и чистка неиспользуемых импортов."
+    "• <b>Защита от лимитов (FloodWait):</b> Добавлена интеллектуальная обертка для API-вызовов Telegram. Бот автоматически переждет ограничение и доставит сообщение.\n"
+    "• <b>Оптимизация работы с файлами:</b> Полностью убраны блокирующие операции поиска файлов (glob). Файлы теперь сохраняются по строгому идентификатору, что ускоряет очистку диска.\n"
+    "• <b>Стабильность базы данных:</b> Улучшена валидация параметров обновления SQL-запросов."
 )
 
 
@@ -588,7 +609,7 @@ async def check_and_broadcast_changelog(bot: Bot):
     if admin_settings.get("notify_startup", 1) == 1:
         try:
             status_text = "перезапущен" if is_restart else "запущен"
-            await bot.send_message(USER_ID, f"🤖 Бот успешно {status_text}!")
+            await safe_api_call(bot.send_message, USER_ID, f"🤖 Бот успешно {status_text}!")
         except Exception as e:
             logger.warning(f"Failed to send startup notification to admin: {e}")
 
@@ -604,7 +625,7 @@ async def check_and_broadcast_changelog(bot: Bot):
                 user_settings = await UserSettingsDB.get_settings(uid)
                 if user_settings.get("notify_startup", 1) == 1:
                     try:
-                        await bot.send_message(uid, "🤖 Бот снова в сети и готов к работе после технического перерыва!")
+                        await safe_api_call(bot.send_message, uid, "🤖 Бот снова в сети и готов к работе после технического перерыва!")
                         await asyncio.sleep(0.05)
                     except Exception as e:
                         logger.warning(f"Failed to send recovery notification to {uid}: {e}")
@@ -659,45 +680,45 @@ async def _send_media_with_fallback(
 ):
     try:
         if media_type == "photo":
-            await bot.send_photo(recipient_id, photo=media_val, caption=msg, parse_mode='html')
+            await safe_api_call(bot.send_photo, recipient_id, photo=media_val, caption=msg, parse_mode='html')
         elif media_type == "video":
-            await bot.send_video(recipient_id, video=media_val, caption=msg, parse_mode='html')
+            await safe_api_call(bot.send_video, recipient_id, video=media_val, caption=msg, parse_mode='html')
         elif media_type == "voice":
-            await bot.send_voice(recipient_id, voice=media_val, caption=msg, parse_mode='html')
+            await safe_api_call(bot.send_voice, recipient_id, voice=media_val, caption=msg, parse_mode='html')
         elif media_type == "video_note":
-            await bot.send_message(recipient_id, msg, parse_mode='html')
-            await bot.send_video_note(recipient_id, video_note=media_val)
+            await safe_api_call(bot.send_message, recipient_id, msg, parse_mode='html')
+            await safe_api_call(bot.send_video_note, recipient_id, video_note=media_val)
         elif media_type == "document":
-            await bot.send_document(recipient_id, document=media_val, caption=msg, parse_mode='html')
+            await safe_api_call(bot.send_document, recipient_id, document=media_val, caption=msg, parse_mode='html')
         elif media_type == "audio":
-            await bot.send_audio(recipient_id, audio=media_val, caption=msg, parse_mode='html')
+            await safe_api_call(bot.send_audio, recipient_id, audio=media_val, caption=msg, parse_mode='html')
         elif media_type == "sticker":
-            await bot.send_message(recipient_id, msg, parse_mode='html')
-            await bot.send_sticker(recipient_id, sticker=media_val)
+            await safe_api_call(bot.send_message, recipient_id, msg, parse_mode='html')
+            await safe_api_call(bot.send_sticker, recipient_id, sticker=media_val)
         elif media_type == "animation":
-            await bot.send_animation(recipient_id, animation=media_val, caption=msg, parse_mode='html')
+            await safe_api_call(bot.send_animation, recipient_id, animation=media_val, caption=msg, parse_mode='html')
         else:
-            await bot.send_message(recipient_id, msg, parse_mode='html')
+            await safe_api_call(bot.send_message, recipient_id, msg, parse_mode='html')
     except Exception as e:
         logger.error(f"Failed to send media with caption: {e}")
         try:
-            await bot.send_message(recipient_id, msg, parse_mode='html')
+            await safe_api_call(bot.send_message, recipient_id, msg, parse_mode='html')
             if media_type == "photo":
-                await bot.send_photo(recipient_id, photo=media_val)
+                await safe_api_call(bot.send_photo, recipient_id, photo=media_val)
             elif media_type == "video":
-                await bot.send_video(recipient_id, video=media_val)
+                await safe_api_call(bot.send_video, recipient_id, video=media_val)
             elif media_type == "voice":
-                await bot.send_voice(recipient_id, voice=media_val)
+                await safe_api_call(bot.send_voice, recipient_id, voice=media_val)
             elif media_type == "video_note":
-                await bot.send_video_note(recipient_id, video_note=media_val)
+                await safe_api_call(bot.send_video_note, recipient_id, video_note=media_val)
             elif media_type == "document":
-                await bot.send_document(recipient_id, document=media_val)
+                await safe_api_call(bot.send_document, recipient_id, document=media_val)
             elif media_type == "audio":
-                await bot.send_audio(recipient_id, audio=media_val)
+                await safe_api_call(bot.send_audio, recipient_id, audio=media_val)
             elif media_type == "sticker":
-                await bot.send_sticker(recipient_id, sticker=media_val)
+                await safe_api_call(bot.send_sticker, recipient_id, sticker=media_val)
             elif media_type == "animation":
-                await bot.send_animation(recipient_id, animation=media_val)
+                await safe_api_call(bot.send_animation, recipient_id, animation=media_val)
         except Exception as e2:
             logger.error(f"Fallback media sending also failed: {e2}")
 
@@ -731,9 +752,9 @@ async def send_msg(
     local_path = None
     if file_id:
         downloads_dir = os.path.join(BASE_DIR, "downloads")
-        files = glob.glob(os.path.join(downloads_dir, f"{file_id}.*"))
-        if files:
-            local_path = files[0]
+        path_candidate = os.path.join(downloads_dir, file_id)
+        if os.path.exists(path_candidate):
+            local_path = path_candidate
 
     media_val = types.FSInputFile(local_path) if local_path else file_id
 
@@ -757,7 +778,7 @@ async def send_msg(
         if media_type != "text" and file_id:
             await _send_media_with_fallback(bot, recipient_id, media_type, media_val, msg)
         else:
-            await bot.send_message(recipient_id, msg, parse_mode='html')
+            await safe_api_call(bot.send_message, recipient_id, msg, parse_mode='html')
     else:
         new_text_escaped = escape(message_new) if message_new else "<i>(без описания/текста)</i>"
         msg = EDITED_MESSAGE_FORMAT.format(
@@ -771,7 +792,7 @@ async def send_msg(
         if media_type != "text" and file_id:
             await _send_media_with_fallback(bot, recipient_id, media_type, media_val, msg)
         else:
-            await bot.send_message(recipient_id, msg, parse_mode='html')
+            await safe_api_call(bot.send_message, recipient_id, msg, parse_mode='html')
 
 
 @router.business_connection()
@@ -1169,10 +1190,9 @@ async def startup_media_callback(callback_query: types.CallbackQuery, bot: Bot):
                 
             local_path = None
             downloads_dir = os.path.join(BASE_DIR, "downloads")
-            import glob
-            files = glob.glob(os.path.join(downloads_dir, f"{file_id}.*"))
-            if files:
-                local_path = files[0]
+            path_candidate = os.path.join(downloads_dir, file_id)
+            if os.path.exists(path_candidate):
+                local_path = path_candidate
                 
             media_val = types.FSInputFile(local_path) if local_path else file_id
             
@@ -1214,13 +1234,12 @@ async def startup_media_callback(callback_query: types.CallbackQuery, bot: Bot):
             file_id = item.get("file_id")
             if file_id:
                 downloads_dir = os.path.join(BASE_DIR, "downloads")
-                import glob
-                files = glob.glob(os.path.join(downloads_dir, f"{file_id}.*"))
-                for f in files:
-                    try:
-                        os.remove(f)
-                    except Exception:
-                        pass
+                local_path = os.path.join(downloads_dir, file_id)
+                try:
+                    if os.path.exists(local_path):
+                        os.remove(local_path)
+                except Exception:
+                    pass
         PENDING_STARTUP_MEDIA.pop(user_id, None)
         await callback_query.message.edit_text("Медиафайлы удалены из буфера.")
 
@@ -1318,25 +1337,23 @@ async def deleted_business_messages(event: types.BusinessMessagesDeleted, bot: B
                     bot=bot
                 )
                 if user_msg.file_id:
-                    import glob
                     downloads_dir = os.path.join(BASE_DIR, "downloads")
-                    files = glob.glob(os.path.join(downloads_dir, f"{user_msg.file_id}.*"))
-                    for f in files:
-                        try:
-                            os.remove(f)
-                            logger.info(f"Deleted local file after deletion: {f}")
-                        except Exception as e:
-                            logger.warning(f"Failed to delete local file {f}: {e}")
+                    local_path = os.path.join(downloads_dir, user_msg.file_id)
+                    try:
+                        if os.path.exists(local_path):
+                            os.remove(local_path)
+                            logger.info(f"Deleted local file after deletion: {local_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete local file {local_path}: {e}")
             await MessageStore.delete(user_id=user_id, message_id=msg_id)
 
 
 async def download_media(bot: Bot, file_id: str) -> Union[str, None]:
     try:
         file_info = await bot.get_file(file_id)
-        ext = os.path.splitext(file_info.file_path)[1] or ""
         downloads_dir = os.path.join(BASE_DIR, "downloads")
         os.makedirs(downloads_dir, exist_ok=True)
-        local_path = os.path.join(downloads_dir, f"{file_id}{ext}")
+        local_path = os.path.join(downloads_dir, file_id)
         if os.path.exists(local_path):
             return local_path
         await bot.download_file(file_info.file_path, local_path)
