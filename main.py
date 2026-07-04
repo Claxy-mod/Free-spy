@@ -4,7 +4,6 @@ import sqlite3
 import gc
 import sys
 import signal
-import glob
 try:
     import resource
 except ImportError:
@@ -52,6 +51,13 @@ except Exception as e:
 
 cipher_suite = Fernet(ENCRYPTION_KEY.encode())
 
+MEMORY_GC_THRESHOLD_MB = int(os.getenv("MEMORY_GC_THRESHOLD_MB", "150"))
+MEMORY_KILL_THRESHOLD_MB = int(os.getenv("MEMORY_KILL_THRESHOLD_MB", "400"))
+CLEANUP_DAYS = int(os.getenv("CLEANUP_DAYS", "30"))
+SELF_PING_INTERVAL_SEC = int(os.getenv("SELF_PING_INTERVAL_SEC", "300"))
+RACE_CONDITION_RETRY_ATTEMPTS = int(os.getenv("RACE_CONDITION_RETRY_ATTEMPTS", "10"))
+RACE_CONDITION_RETRY_DELAY = float(os.getenv("RACE_CONDITION_RETRY_DELAY", "0.1"))
+
 
 def encrypt_text(text: str) -> str:
     if not text:
@@ -80,6 +86,35 @@ async def safe_api_call(func, *args, **kwargs):
     except Exception as e:
         logger.error(f"API call failed: {e}")
         raise
+
+
+async def safe_send(bot: Bot, chat_id: int, text: str, **kwargs):
+    """Отправка сообщения с защитой от FloodWait"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            return await bot.send_message(chat_id, text, **kwargs)
+        except TelegramRetryAfter as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"FloodWait {e.retry_after}s for chat {chat_id}. Retrying...")
+                await asyncio.sleep(e.retry_after)
+            else:
+                raise
+        except Exception as e:
+            logger.error(f"Failed to send to {chat_id}: {e}")
+            raise
+
+
+SEND_METHODS = {
+    "photo": lambda bot, chat_id, media, **kw: bot.send_photo(chat_id, photo=media, **kw),
+    "video": lambda bot, chat_id, media, **kw: bot.send_video(chat_id, video=media, **kw),
+    "voice": lambda bot, chat_id, media, **kw: bot.send_voice(chat_id, voice=media, **kw),
+    "document": lambda bot, chat_id, media, **kw: bot.send_document(chat_id, document=media, **kw),
+    "audio": lambda bot, chat_id, media, **kw: bot.send_audio(chat_id, audio=media, **kw),
+    "animation": lambda bot, chat_id, media, **kw: bot.send_animation(chat_id, animation=media, **kw),
+}
+
+NO_CAPTION_TYPES = {"video_note", "sticker"}
 
 TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
@@ -188,19 +223,16 @@ ALLOWED_COLUMNS = {
 
 
 def update_format(sql, parameters: dict) -> tuple[str, list]:
-    validated_params = []
-    for key in parameters:
+    validated = []
+    for key, value in parameters.items():
         if key not in ALLOWED_COLUMNS:
-            raise ValueError(f"Unsanitized database column name detected: {key}")
-        validated_params.append((key, parameters[key]))
+            raise ValueError(f"Unsanitized database column name: {key}")
+        validated.append((key, value))
     
-    if 'config' in globals() and hasattr(config, 'PLACEHOLDER'):
-        placeholder = getattr(config, 'PLACEHOLDER')
-    else:
-        placeholder = globals().get('PLACEHOLDER', '?')
-    values = ", ".join([f"{key} = {placeholder}" for key, _ in validated_params])
-    sql += f" {values}"
-    return sql, [value for _, value in validated_params]
+    placeholder = config.PLACEHOLDER if ('config' in globals() and hasattr(config, 'PLACEHOLDER')) else PLACEHOLDER
+    set_clause = ", ".join([f"{key} = {placeholder}" for key, _ in validated])
+    sql += f" {set_clause}"
+    return sql, [value for _, value in validated]
 
 
 class MessageRecord(BaseModel):
@@ -539,17 +571,16 @@ async def cleanup_old_messages():
         next_run = now_local.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
         sleep_seconds = (next_run - now_local).total_seconds()
         await asyncio.sleep(sleep_seconds)
-        cutoff_datetime = datetime.now(timezone.utc) - timedelta(days=30)
+        cutoff_datetime = datetime.now(timezone.utc) - timedelta(days=CLEANUP_DAYS)
         cutoff_timestamp_iso = cutoff_datetime.isoformat()
         await MessageStore.delete_old_messages(cutoff_timestamp_iso)
 
 
-BOT_VERSION = "1.8.0"
+BOT_VERSION = "1.9.0"
 CHANGELOG_TEXT = (
     f"📢 <b>Обновление бота (v{BOT_VERSION}):</b>\n\n"
-    "• <b>Защита от лимитов (FloodWait):</b> Добавлена интеллектуальная обертка для API-вызовов Telegram. Бот автоматически переждет ограничение и доставит сообщение.\n"
-    "• <b>Оптимизация работы с файлами:</b> Полностью убраны блокирующие операции поиска файлов (glob). Файлы теперь сохраняются по строгому идентификатору, что ускоряет очистку диска.\n"
-    "• <b>Стабильность базы данных:</b> Улучшена валидация параметров обновления SQL-запросов."
+    "• <b>Гибкая конфигурация (Env):</b> Основные лимиты памяти, интервалы самоочистки и пинга теперь можно настраивать через переменные окружения, не меняя код.\n"
+    "• <b>Улучшение рассылок (DRY):</b> Оптимизирована структура отправки медиафайлов. Все вызовы переписаны под единый безопасный метод доставки с автоматической защитой от лимитов Telegram."
 )
 
 
@@ -567,13 +598,13 @@ async def monitor_memory():
             
             logger.info(f"Current memory usage: {usage_mb:.2f} MB")
             
-            # If memory exceeds 150MB, run GC
-            if usage_mb > 150:
+            # If memory exceeds threshold, run GC
+            if usage_mb > MEMORY_GC_THRESHOLD_MB:
                 collected = gc.collect()
                 logger.info(f"Memory cleanup: current usage is {usage_mb:.2f} MB. gc.collect() cleared {collected} objects.")
                 
-            # If memory exceeds 400MB (Render free tier limit is 512MB), restart the bot gracefully
-            if usage_mb > 400:
+            # If memory exceeds kill threshold, restart the bot gracefully
+            if usage_mb > MEMORY_KILL_THRESHOLD_MB:
                 logger.critical(f"Memory usage critical ({usage_mb:.2f} MB). Triggering graceful shutdown.")
                 # Send SIGTERM to self. The Dispatcher polling loop catches this signal and terminates gracefully.
                 os.kill(os.getpid(), signal.SIGTERM)
@@ -609,7 +640,7 @@ async def check_and_broadcast_changelog(bot: Bot):
     if admin_settings.get("notify_startup", 1) == 1:
         try:
             status_text = "перезапущен" if is_restart else "запущен"
-            await safe_api_call(bot.send_message, USER_ID, f"🤖 Бот успешно {status_text}!")
+            await safe_send(bot, USER_ID, f"🤖 Бот успешно {status_text}!")
         except Exception as e:
             logger.warning(f"Failed to send startup notification to admin: {e}")
 
@@ -625,7 +656,7 @@ async def check_and_broadcast_changelog(bot: Bot):
                 user_settings = await UserSettingsDB.get_settings(uid)
                 if user_settings.get("notify_startup", 1) == 1:
                     try:
-                        await safe_api_call(bot.send_message, uid, "🤖 Бот снова в сети и готов к работе после технического перерыва!")
+                        await safe_send(bot, uid, "🤖 Бот снова в сети и готов к работе после технического перерыва!")
                         await asyncio.sleep(0.05)
                     except Exception as e:
                         logger.warning(f"Failed to send recovery notification to {uid}: {e}")
@@ -679,48 +710,34 @@ async def _send_media_with_fallback(
     msg: str
 ):
     try:
-        if media_type == "photo":
-            await safe_api_call(bot.send_photo, recipient_id, photo=media_val, caption=msg, parse_mode='html')
-        elif media_type == "video":
-            await safe_api_call(bot.send_video, recipient_id, video=media_val, caption=msg, parse_mode='html')
-        elif media_type == "voice":
-            await safe_api_call(bot.send_voice, recipient_id, voice=media_val, caption=msg, parse_mode='html')
-        elif media_type == "video_note":
-            await safe_api_call(bot.send_message, recipient_id, msg, parse_mode='html')
-            await safe_api_call(bot.send_video_note, recipient_id, video_note=media_val)
-        elif media_type == "document":
-            await safe_api_call(bot.send_document, recipient_id, document=media_val, caption=msg, parse_mode='html')
-        elif media_type == "audio":
-            await safe_api_call(bot.send_audio, recipient_id, audio=media_val, caption=msg, parse_mode='html')
-        elif media_type == "sticker":
-            await safe_api_call(bot.send_message, recipient_id, msg, parse_mode='html')
-            await safe_api_call(bot.send_sticker, recipient_id, sticker=media_val)
-        elif media_type == "animation":
-            await safe_api_call(bot.send_animation, recipient_id, animation=media_val, caption=msg, parse_mode='html')
+        if media_type in NO_CAPTION_TYPES:
+            await safe_send(bot, recipient_id, msg, parse_mode='html')
+            if media_type == "video_note":
+                await bot.send_video_note(recipient_id, video_note=media_val)
+            elif media_type == "sticker":
+                await bot.send_sticker(recipient_id, sticker=media_val)
         else:
-            await safe_api_call(bot.send_message, recipient_id, msg, parse_mode='html')
+            send_method = SEND_METHODS.get(media_type)
+            if send_method:
+                await send_method(bot, recipient_id, media_val, caption=msg, parse_mode='html')
+            else:
+                await safe_send(bot, recipient_id, msg, parse_mode='html')
     except Exception as e:
         logger.error(f"Failed to send media with caption: {e}")
-        try:
-            await safe_api_call(bot.send_message, recipient_id, msg, parse_mode='html')
-            if media_type == "photo":
-                await safe_api_call(bot.send_photo, recipient_id, photo=media_val)
-            elif media_type == "video":
-                await safe_api_call(bot.send_video, recipient_id, video=media_val)
-            elif media_type == "voice":
-                await safe_api_call(bot.send_voice, recipient_id, voice=media_val)
-            elif media_type == "video_note":
-                await safe_api_call(bot.send_video_note, recipient_id, video_note=media_val)
-            elif media_type == "document":
-                await safe_api_call(bot.send_document, recipient_id, document=media_val)
-            elif media_type == "audio":
-                await safe_api_call(bot.send_audio, recipient_id, audio=media_val)
+        # Fallback - отправляем отдельно текст, затем медиа
+        await safe_send(bot, recipient_id, msg, parse_mode='html')
+        if media_type in NO_CAPTION_TYPES:
+            if media_type == "video_note":
+                await bot.send_video_note(recipient_id, video_note=media_val)
             elif media_type == "sticker":
-                await safe_api_call(bot.send_sticker, recipient_id, sticker=media_val)
-            elif media_type == "animation":
-                await safe_api_call(bot.send_animation, recipient_id, animation=media_val)
-        except Exception as e2:
-            logger.error(f"Fallback media sending also failed: {e2}")
+                await bot.send_sticker(recipient_id, sticker=media_val)
+        else:
+            send_method = SEND_METHODS.get(media_type)
+            if send_method:
+                try:
+                    await send_method(bot, recipient_id, media_val)
+                except Exception as e2:
+                    logger.error(f"Fallback media sending failed: {e2}")
 
 
 async def send_msg(
@@ -778,7 +795,7 @@ async def send_msg(
         if media_type != "text" and file_id:
             await _send_media_with_fallback(bot, recipient_id, media_type, media_val, msg)
         else:
-            await safe_api_call(bot.send_message, recipient_id, msg, parse_mode='html')
+            await safe_send(bot, recipient_id, msg, parse_mode='html')
     else:
         new_text_escaped = escape(message_new) if message_new else "<i>(без описания/текста)</i>"
         msg = EDITED_MESSAGE_FORMAT.format(
@@ -792,7 +809,7 @@ async def send_msg(
         if media_type != "text" and file_id:
             await _send_media_with_fallback(bot, recipient_id, media_type, media_val, msg)
         else:
-            await safe_api_call(bot.send_message, recipient_id, msg, parse_mode='html')
+            await safe_send(bot, recipient_id, msg, parse_mode='html')
 
 
 @router.business_connection()
@@ -865,9 +882,26 @@ async def broadcast_command(message: types.Message, bot: Bot):
                     message_id=reply.message_id
                 )
             else:
-                await bot.send_message(uid, broadcast_text)
+                await safe_send(bot, uid, broadcast_text)
             success_count += 1
             await asyncio.sleep(0.05)
+        except TelegramRetryAfter as e:
+            logger.warning(f"FloodWait hit during broadcast: sleeping for {e.retry_after}s")
+            await asyncio.sleep(e.retry_after)
+            try:
+                if reply:
+                    await bot.copy_message(
+                        chat_id=uid,
+                        from_chat_id=message.chat.id,
+                        message_id=reply.message_id
+                    )
+                else:
+                    await safe_send(bot, uid, broadcast_text)
+                success_count += 1
+                await asyncio.sleep(0.05)
+            except Exception as retry_err:
+                logger.warning(f"Failed to send broadcast to {uid} after retry: {retry_err}")
+                fail_count += 1
         except Exception as e:
             logger.warning(f"Failed to send broadcast to {uid}: {e}")
             fail_count += 1
@@ -1197,24 +1231,18 @@ async def startup_media_callback(callback_query: types.CallbackQuery, bot: Bot):
             media_val = types.FSInputFile(local_path) if local_path else file_id
             
             try:
-                if media_type == "photo":
-                    await bot.send_photo(user_id, photo=media_val, caption=caption, parse_mode='html')
-                elif media_type == "video":
-                    await bot.send_video(user_id, video=media_val, caption=caption, parse_mode='html')
-                elif media_type == "voice":
-                    await bot.send_voice(user_id, voice=media_val, caption=caption, parse_mode='html')
-                elif media_type == "video_note":
-                    await bot.send_message(user_id, caption, parse_mode='html')
-                    await bot.send_video_note(user_id, video_note=media_val)
-                elif media_type == "document":
-                    await bot.send_document(user_id, document=media_val, caption=caption, parse_mode='html')
-                elif media_type == "audio":
-                    await bot.send_audio(user_id, audio=media_val, caption=caption, parse_mode='html')
-                elif media_type == "sticker":
-                    await bot.send_message(user_id, caption, parse_mode='html')
-                    await bot.send_sticker(user_id, sticker=media_val)
-                elif media_type == "animation":
-                    await bot.send_animation(user_id, animation=media_val, caption=caption, parse_mode='html')
+                if media_type in NO_CAPTION_TYPES:
+                    await safe_send(bot, user_id, caption, parse_mode='html')
+                    if media_type == "video_note":
+                        await bot.send_video_note(user_id, video_note=media_val)
+                    elif media_type == "sticker":
+                        await bot.send_sticker(user_id, sticker=media_val)
+                else:
+                    send_method = SEND_METHODS.get(media_type)
+                    if send_method:
+                        await send_method(bot, user_id, media_val, caption=caption, parse_mode='html')
+                    else:
+                        await safe_send(bot, user_id, caption, parse_mode='html')
                 
                 if local_path:
                     try:
@@ -1252,9 +1280,9 @@ async def edited_business_message(message: types.Message):
             return
         user_msg = await MessageStore.get(user_id=message.from_user.id, message_id=message.message_id)
         if not user_msg:
-            # Retry up to 10 times with 0.1s sleep to handle concurrent insert/edit race condition
-            for _ in range(10):
-                await asyncio.sleep(0.1)
+            # Retry to handle concurrent insert/edit race condition
+            for _ in range(RACE_CONDITION_RETRY_ATTEMPTS):
+                await asyncio.sleep(RACE_CONDITION_RETRY_DELAY)
                 user_msg = await MessageStore.get(user_id=message.from_user.id, message_id=message.message_id)
                 if user_msg:
                     break
@@ -1302,9 +1330,9 @@ async def deleted_business_messages(event: types.BusinessMessagesDeleted, bot: B
     for msg_id in event.message_ids:
         user_msg = await MessageStore.get(user_id=user_id, message_id=msg_id)
         if not user_msg:
-            # Retry up to 10 times with 0.1s sleep to handle concurrent insert/delete race condition
-            for _ in range(10):
-                await asyncio.sleep(0.1)
+            # Retry to handle concurrent insert/delete race condition
+            for _ in range(RACE_CONDITION_RETRY_ATTEMPTS):
+                await asyncio.sleep(RACE_CONDITION_RETRY_DELAY)
                 user_msg = await MessageStore.get(user_id=user_id, message_id=msg_id)
                 if user_msg:
                     break
@@ -1541,8 +1569,8 @@ async def self_ping():
         
     while True:
         try:
-            # Ping every 5 minutes to keep Render instance awake
-            await asyncio.sleep(5 * 60)
+            # Ping to keep Render instance awake
+            await asyncio.sleep(SELF_PING_INTERVAL_SEC)
             async with aiohttp.ClientSession() as session:
                 async with session.get(external_url) as response:
                     logger.info(f"Self-ping to {external_url}: {response.status}")
