@@ -576,11 +576,11 @@ async def cleanup_old_messages():
         await MessageStore.delete_old_messages(cutoff_timestamp_iso)
 
 
-BOT_VERSION = "1.9.0"
+BOT_VERSION = "1.9.1"
 CHANGELOG_TEXT = (
     f"📢 <b>Обновление бота (v{BOT_VERSION}):</b>\n\n"
-    "• <b>Гибкая конфигурация (Env):</b> Основные лимиты памяти, интервалы самоочистки и пинга теперь можно настраивать через переменные окружения, не меняя код.\n"
-    "• <b>Улучшение рассылок (DRY):</b> Оптимизирована структура отправки медиафайлов. Все вызовы переписаны под единый безопасный метод доставки с автоматической защитой от лимитов Telegram."
+    "• <b>Резервные копии медиа:</b> При ошибках отправки локальных файлов бот автоматически пересылает оригинальные файлы по Telegram File ID.\n"
+    "• <b>Улучшение надежности:</b> Добавлены перехватчики исключений в обработчик удаления бизнес-сообщений, а также отключено избыточное скачивание стикеров на диск."
 )
 
 
@@ -707,7 +707,8 @@ async def _send_media_with_fallback(
     recipient_id: int,
     media_type: str,
     media_val: Union[types.FSInputFile, str],
-    msg: str
+    msg: str,
+    original_file_id: Union[str, None] = None
 ):
     try:
         if media_type in NO_CAPTION_TYPES:
@@ -724,18 +725,22 @@ async def _send_media_with_fallback(
                 await safe_send(bot, recipient_id, msg, parse_mode='html')
     except Exception as e:
         logger.error(f"Failed to send media with caption: {e}")
-        # Fallback - отправляем отдельно текст, затем медиа
+        # Fallback - отправляем отдельно текст, затем медиа (используя original_file_id как резерв)
         await safe_send(bot, recipient_id, msg, parse_mode='html')
+        fallback_val = original_file_id if original_file_id else media_val
         if media_type in NO_CAPTION_TYPES:
-            if media_type == "video_note":
-                await bot.send_video_note(recipient_id, video_note=media_val)
-            elif media_type == "sticker":
-                await bot.send_sticker(recipient_id, sticker=media_val)
+            try:
+                if media_type == "video_note":
+                    await bot.send_video_note(recipient_id, video_note=fallback_val)
+                elif media_type == "sticker":
+                    await bot.send_sticker(recipient_id, sticker=fallback_val)
+            except Exception as e2:
+                logger.error(f"Fallback no-caption media sending failed: {e2}")
         else:
             send_method = SEND_METHODS.get(media_type)
             if send_method:
                 try:
-                    await send_method(bot, recipient_id, media_val)
+                    await send_method(bot, recipient_id, fallback_val)
                 except Exception as e2:
                     logger.error(f"Fallback media sending failed: {e2}")
 
@@ -793,7 +798,7 @@ async def send_msg(
             )
         
         if media_type != "text" and file_id:
-            await _send_media_with_fallback(bot, recipient_id, media_type, media_val, msg)
+            await _send_media_with_fallback(bot, recipient_id, media_type, media_val, msg, original_file_id=file_id)
         else:
             await safe_send(bot, recipient_id, msg, parse_mode='html')
     else:
@@ -807,7 +812,7 @@ async def send_msg(
             new_text=new_text_escaped
         )
         if media_type != "text" and file_id:
-            await _send_media_with_fallback(bot, recipient_id, media_type, media_val, msg)
+            await _send_media_with_fallback(bot, recipient_id, media_type, media_val, msg, original_file_id=file_id)
         else:
             await safe_send(bot, recipient_id, msg, parse_mode='html')
 
@@ -1328,52 +1333,55 @@ async def deleted_business_messages(event: types.BusinessMessagesDeleted, bot: B
     if not recipient_id:
         return
     for msg_id in event.message_ids:
-        user_msg = await MessageStore.get(user_id=user_id, message_id=msg_id)
-        if not user_msg:
-            # Retry to handle concurrent insert/delete race condition
-            for _ in range(RACE_CONDITION_RETRY_ATTEMPTS):
-                await asyncio.sleep(RACE_CONDITION_RETRY_DELAY)
-                user_msg = await MessageStore.get(user_id=user_id, message_id=msg_id)
-                if user_msg:
-                    break
-        if user_msg:
-            message_timestamp = datetime.fromisoformat(user_msg.timestamp).astimezone(timezone_local)
-            timestamp_formatted = message_timestamp.strftime('%d/%m/%y %H:%M')
-            if IS_BOOTING:
-                MISSED_UPDATES_BUFFER.append({
-                    "type": "delete",
-                    "recipient_id": recipient_id,
-                    "user_fullname": user_fullname,
-                    "user_id": user_id,
-                    "username": username,
-                    "timestamp": timestamp_formatted,
-                    "media_type": user_msg.media_type,
-                    "file_id": user_msg.file_id,
-                    "old_text": user_msg.message_text
-                })
-            else:
-                await send_msg(
-                    message_old=user_msg.message_text,
-                    message_new=None,
-                    user_fullname=user_fullname,
-                    user_id=user_id,
-                    timestamp=timestamp_formatted,
-                    recipient_id=recipient_id,
-                    username=username,
-                    media_type=user_msg.media_type,
-                    file_id=user_msg.file_id,
-                    bot=bot
-                )
-                if user_msg.file_id:
-                    downloads_dir = os.path.join(BASE_DIR, "downloads")
-                    local_path = os.path.join(downloads_dir, user_msg.file_id)
-                    try:
-                        if os.path.exists(local_path):
-                            os.remove(local_path)
-                            logger.info(f"Deleted local file after deletion: {local_path}")
-                    except Exception as e:
-                        logger.warning(f"Failed to delete local file {local_path}: {e}")
-            await MessageStore.delete(user_id=user_id, message_id=msg_id)
+        try:
+            user_msg = await MessageStore.get(user_id=user_id, message_id=msg_id)
+            if not user_msg:
+                # Retry to handle concurrent insert/delete race condition
+                for _ in range(RACE_CONDITION_RETRY_ATTEMPTS):
+                    await asyncio.sleep(RACE_CONDITION_RETRY_DELAY)
+                    user_msg = await MessageStore.get(user_id=user_id, message_id=msg_id)
+                    if user_msg:
+                        break
+            if user_msg:
+                message_timestamp = datetime.fromisoformat(user_msg.timestamp).astimezone(timezone_local)
+                timestamp_formatted = message_timestamp.strftime('%d/%m/%y %H:%M')
+                if IS_BOOTING:
+                    MISSED_UPDATES_BUFFER.append({
+                        "type": "delete",
+                        "recipient_id": recipient_id,
+                        "user_fullname": user_fullname,
+                        "user_id": user_id,
+                        "username": username,
+                        "timestamp": timestamp_formatted,
+                        "media_type": user_msg.media_type,
+                        "file_id": user_msg.file_id,
+                        "old_text": user_msg.message_text
+                    })
+                else:
+                    await send_msg(
+                        message_old=user_msg.message_text,
+                        message_new=None,
+                        user_fullname=user_fullname,
+                        user_id=user_id,
+                        timestamp=timestamp_formatted,
+                        recipient_id=recipient_id,
+                        username=username,
+                        media_type=user_msg.media_type,
+                        file_id=user_msg.file_id,
+                        bot=bot
+                    )
+                    if user_msg.file_id:
+                        downloads_dir = os.path.join(BASE_DIR, "downloads")
+                        local_path = os.path.join(downloads_dir, user_msg.file_id)
+                        try:
+                            if os.path.exists(local_path):
+                                os.remove(local_path)
+                                logger.info(f"Deleted local file after deletion: {local_path}")
+                        except Exception as e:
+                            logger.warning(f"Failed to delete local file {local_path}: {e}")
+                await MessageStore.delete(user_id=user_id, message_id=msg_id)
+        except Exception as e:
+            logger.error(f"Error processing deleted message {msg_id} in business chat: {e}")
 
 
 async def download_media(bot: Bot, file_id: str) -> Union[str, None]:
@@ -1515,7 +1523,7 @@ async def business_message(message: types.Message):
             media_type = "animation"
             file_id = message.animation.file_id
             
-        if file_id:
+        if file_id and media_type != "sticker":
             asyncio.create_task(download_media(message.bot, file_id))
 
         message_datetime_utc = message.date.replace(tzinfo=timezone.utc)
