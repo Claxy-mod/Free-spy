@@ -584,10 +584,11 @@ async def cleanup_old_messages():
         await MessageStore.delete_old_messages(cutoff_timestamp_iso)
 
 
-BOT_VERSION = "1.9.3"
+BOT_VERSION = "1.9.4"
 CHANGELOG_TEXT = (
     f"📢 <b>Обновление бота (v{BOT_VERSION}):</b>\n\n"
-    "• <b>Логирование пересланных сообщений (Forward Info):</b> Бот теперь запоминает и детально отображает информацию об исходном отправителе пересланного сообщения (включая имя, юзернейм и ID) при его изменении или удалении."
+    "• <b>Повышение отказоустойчивости:</b> Добавлена безопасная обработка (try/except) при десериализации метаданных пересланных сообщений (Forward Info).\n"
+    "• <b>Отображение в медиа:</b> Восстановлено отображение источника пересланного сообщения при обработке удаленных/измененных медиафайлов во время запуска бота."
 )
 
 
@@ -815,7 +816,13 @@ async def send_msg(
             new_text=new_text_escaped
         )
 
-    forward_data = json.loads(forward_info) if forward_info else None
+    forward_data = None
+    if forward_info:
+        try:
+            forward_data = json.loads(forward_info)
+        except Exception as e:
+            logger.warning(f"Failed to parse forward_info JSON in send_msg: {e}")
+
     if forward_data:
         sender_name = forward_data['sender_name']
         username = forward_data.get('username')
@@ -1139,7 +1146,13 @@ async def process_startup_digest(bot: Bot):
             media_type = item["media_type"]
             media_name = MEDIA_NAMES.get(media_type, "сообщение")
             
-            forward_data = json.loads(item["forward_info"]) if item.get("forward_info") else None
+            forward_data = None
+            if item.get("forward_info"):
+                try:
+                    forward_data = json.loads(item["forward_info"])
+                except Exception as e:
+                    logger.warning(f"Failed to parse forward_info JSON in digest: {e}")
+
             if forward_data:
                 sender_name = forward_data['sender_name']
                 username = forward_data.get('username')
@@ -1249,12 +1262,33 @@ async def startup_media_callback(callback_query: types.CallbackQuery, bot: Bot):
             timestamp = item["timestamp"]
             media_name = MEDIA_NAMES.get(media_type, "сообщение")
             
+            # Безопасное извлечение forward_info
+            forward_data = None
+            if item.get("forward_info"):
+                try:
+                    forward_data = json.loads(item["forward_info"])
+                except Exception as e:
+                    logger.warning(f"Failed to parse forward_info JSON in startup media callback: {e}")
+
+            if forward_data:
+                sender_name = forward_data['sender_name']
+                username = forward_data.get('username')
+                sender_id = forward_data.get('sender_id')
+                display = escape(sender_name)
+                if username:
+                    display += f" (@{escape(username)})"
+                if sender_id:
+                    display += f" (ID: <code>{sender_id}</code>)"
+                forward_part = f"\n📤 <b>Переслано от:</b> {display}"
+            else:
+                forward_part = ""
+            
             if item["type"] == "delete":
-                caption = f"💾 <b>Удаленное медиа ({media_name}) от {user_display_escaped}</b> в {timestamp}"
+                caption = f"💾 <b>Удаленное медиа ({media_name}) от {user_display_escaped}</b> в {timestamp}{forward_part}"
                 if item.get("old_text") and item["old_text"] != "<i>(без описания/текста)</i>":
                     caption += f"\n\n💬 <b>Содержание:</b>\n<blockquote>{safe_escape(item['old_text'])}</blockquote>"
             else:
-                caption = f"💾 <b>Измененное медиа ({media_name}) от {user_display_escaped}</b> в {timestamp}"
+                caption = f"💾 <b>Измененное медиа ({media_name}) от {user_display_escaped}</b> в {timestamp}{forward_part}"
                 if item.get("old_text") and item["old_text"] != "<i>(без описания/текста)</i>":
                     caption += f"\n\n<b>Было:</b>\n<blockquote>{safe_escape(item['old_text'])}</blockquote>"
                 if item.get("new_text") and item["new_text"] != "<i>(без описания/текста)</i>":

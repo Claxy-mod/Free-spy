@@ -1,0 +1,26 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "name": "Free Spy Bot",
+  "services": {
+    "bot": {
+      "env": {
+        "BOT_TOKEN": {
+          "description": "Токен вашего Telegram-бота (от @BotFather)",
+          "required": true
+        },
+        "USER_ID": {
+          "description": "Ваш цифровой Telegram ID для получения логов",
+          "required": true
+        },
+        "ENCRYPTION_KEY": {
+          "description": "32-байтный Fernet ключ шифрования (сгенерируйте через generate_key.py)",
+          "required": true
+        },
+        "TIMEZONE_NAME": {
+          "description": "Ваш часовой пояс для логов",
+          "value": "Europe/Moscow"
+        }
+      }
+    }
+  }
+}
