@@ -20,4 +20,5 @@ dist/
 
 # Local test environment
 test/
+.DS_Store
 
