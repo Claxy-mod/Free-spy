@@ -584,10 +584,10 @@ async def cleanup_old_messages():
         await MessageStore.delete_old_messages(cutoff_timestamp_iso)
 
 
-BOT_VERSION = "1.9.2"
+BOT_VERSION = "1.9.3"
 CHANGELOG_TEXT = (
     f"📢 <b>Обновление бота (v{BOT_VERSION}):</b>\n\n"
-    "• <b>Логирование пересланных сообщений (Forward Info):</b> Бот теперь запоминает и отображает информацию об исходном отправителе пересланного сообщения при его изменении или удалении."
+    "• <b>Логирование пересланных сообщений (Forward Info):</b> Бот теперь запоминает и детально отображает информацию об исходном отправителе пересланного сообщения (включая имя, юзернейм и ID) при его изменении или удалении."
 )
 
 
@@ -817,7 +817,17 @@ async def send_msg(
 
     forward_data = json.loads(forward_info) if forward_info else None
     if forward_data:
-        msg += f"\n📤 <b>Переслано от:</b> {escape(forward_data['sender_name'])}"
+        sender_name = forward_data['sender_name']
+        username = forward_data.get('username')
+        sender_id = forward_data.get('sender_id')
+        
+        display = escape(sender_name)
+        if username:
+            display += f" (@{escape(username)})"
+        if sender_id:
+            display += f" (ID: <code>{sender_id}</code>)"
+            
+        msg += f"\n📤 <b>Переслано от:</b> {display}"
 
     if media_type != "text" and file_id:
         await _send_media_with_fallback(bot, recipient_id, media_type, media_val, msg, original_file_id=file_id)
@@ -1130,7 +1140,19 @@ async def process_startup_digest(bot: Bot):
             media_name = MEDIA_NAMES.get(media_type, "сообщение")
             
             forward_data = json.loads(item["forward_info"]) if item.get("forward_info") else None
-            forward_part = f"\n📤 <b>Переслано от:</b> {escape(forward_data['sender_name'])}" if forward_data else ""
+            if forward_data:
+                sender_name = forward_data['sender_name']
+                username = forward_data.get('username')
+                sender_id = forward_data.get('sender_id')
+                
+                display = escape(sender_name)
+                if username:
+                    display += f" (@{escape(username)})"
+                if sender_id:
+                    display += f" (ID: <code>{sender_id}</code>)"
+                forward_part = f"\n📤 <b>Переслано от:</b> {display}"
+            else:
+                forward_part = ""
             
             if item["type"] == "delete":
                 if media_type == "text":
@@ -1547,19 +1569,29 @@ async def business_message(message: types.Message):
         forward_info = None
         if message.forward_origin:
             origin = message.forward_origin
+            sender_id = None
+            username = None
             if origin.type == "user":
                 name = origin.sender_user.full_name
+                sender_id = origin.sender_user.id
+                username = origin.sender_user.username
             elif origin.type == "hidden_user":
                 name = origin.sender_user_name
             elif origin.type == "chat":
                 name = origin.sender_chat.title
+                sender_id = origin.sender_chat.id
+                username = origin.sender_chat.username
             elif origin.type == "channel":
                 name = f"{origin.chat.title} (канал)"
+                sender_id = origin.chat.id
+                username = origin.chat.username
             else:
                 name = "Неизвестный источник"
                 
             forward_info = {
                 "sender_name": name,
+                "sender_id": sender_id,
+                "username": username,
                 "date": origin.date.isoformat() if hasattr(origin, "date") else None
             }
             
