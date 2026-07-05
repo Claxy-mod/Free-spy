@@ -1,4 +1,5 @@
 import configparser
+import json
 import os
 import sqlite3
 import gc
@@ -218,7 +219,7 @@ def db_session():
 # Whitelist of allowed column names to prevent SQL Injection
 ALLOWED_COLUMNS = {
     "user_id", "message_id", "message_text", "timestamp", "media_type", "file_id",
-    "connection_id", "key", "value", "notify_updates", "notify_startup", "delete_reply"
+    "connection_id", "key", "value", "notify_updates", "notify_startup", "delete_reply", "forward_info"
 }
 
 
@@ -242,6 +243,7 @@ class MessageRecord(BaseModel):
     timestamp: str
     media_type: str = "text"
     file_id: Union[str, None] = None
+    forward_info: Union[str, None] = None
 
 
 class MessageStore:
@@ -260,7 +262,8 @@ class MessageStore:
                                        message_text TEXT,
                                        timestamp TEXT,
                                        media_type TEXT DEFAULT 'text',
-                                       file_id TEXT)''')
+                                       file_id TEXT,
+                                       forward_info TEXT)''')
                 else:
                     cursor.execute('''CREATE TABLE IF NOT EXISTS messages
                                       (id INTEGER PRIMARY KEY,
@@ -269,7 +272,8 @@ class MessageStore:
                                        message_text TEXT,
                                        timestamp TEXT,
                                        media_type TEXT DEFAULT 'text',
-                                       file_id TEXT)''')
+                                       file_id TEXT,
+                                       forward_info TEXT)''')
                     try:
                         cursor.execute("ALTER TABLE messages ADD COLUMN media_type TEXT DEFAULT 'text'")
                     except Exception:
@@ -278,17 +282,21 @@ class MessageStore:
                         cursor.execute("ALTER TABLE messages ADD COLUMN file_id TEXT")
                     except Exception:
                         pass
+                try:
+                    cursor.execute("ALTER TABLE messages ADD COLUMN forward_info TEXT")
+                except Exception:
+                    pass
         await asyncio.to_thread(_sync)
 
     @staticmethod
-    async def add(user_id: int, message_id: int, message_text: Union[str, None], timestamp: str, media_type: str = "text", file_id: Union[str, None] = None):
+    async def add(user_id: int, message_id: int, message_text: Union[str, None], timestamp: str, media_type: str = "text", file_id: Union[str, None] = None, forward_info: Union[str, None] = None):
         encrypted_text = encrypt_text(message_text) if message_text else None
         def _sync():
             with db_session() as con:
                 cursor = con.cursor()
                 cursor.execute(
-                    f"INSERT INTO messages (user_id, message_id, message_text, timestamp, media_type, file_id) VALUES ({PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER})",
-                    [user_id, message_id, encrypted_text, timestamp, media_type, file_id],
+                    f"INSERT INTO messages (user_id, message_id, message_text, timestamp, media_type, file_id, forward_info) VALUES ({PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER})",
+                    [user_id, message_id, encrypted_text, timestamp, media_type, file_id, forward_info],
                 )
         await asyncio.to_thread(_sync)
 
@@ -576,11 +584,10 @@ async def cleanup_old_messages():
         await MessageStore.delete_old_messages(cutoff_timestamp_iso)
 
 
-BOT_VERSION = "1.9.1"
+BOT_VERSION = "1.9.2"
 CHANGELOG_TEXT = (
     f"📢 <b>Обновление бота (v{BOT_VERSION}):</b>\n\n"
-    "• <b>Резервные копии медиа:</b> При ошибках отправки локальных файлов бот автоматически пересылает оригинальные файлы по Telegram File ID.\n"
-    "• <b>Улучшение надежности:</b> Добавлены перехватчики исключений в обработчик удаления бизнес-сообщений, а также отключено избыточное скачивание стикеров на диск."
+    "• <b>Логирование пересланных сообщений (Forward Info):</b> Бот теперь запоминает и отображает информацию об исходном отправителе пересланного сообщения при его изменении или удалении."
 )
 
 
@@ -755,7 +762,8 @@ async def send_msg(
     bot: Bot,
     username: Union[str, None] = None,
     media_type: str = "text",
-    file_id: Union[str, None] = None
+    file_id: Union[str, None] = None,
+    forward_info: Union[str, None] = None
 ):
     if username:
         user_display = f"{user_fullname} (@{username})"
@@ -796,11 +804,6 @@ async def send_msg(
                 timestamp=timestamp,
                 old_text=old_text_escaped
             )
-        
-        if media_type != "text" and file_id:
-            await _send_media_with_fallback(bot, recipient_id, media_type, media_val, msg, original_file_id=file_id)
-        else:
-            await safe_send(bot, recipient_id, msg, parse_mode='html')
     else:
         new_text_escaped = escape(message_new) if message_new else "<i>(без описания/текста)</i>"
         msg = EDITED_MESSAGE_FORMAT.format(
@@ -811,10 +814,15 @@ async def send_msg(
             old_text=old_text_escaped,
             new_text=new_text_escaped
         )
-        if media_type != "text" and file_id:
-            await _send_media_with_fallback(bot, recipient_id, media_type, media_val, msg, original_file_id=file_id)
-        else:
-            await safe_send(bot, recipient_id, msg, parse_mode='html')
+
+    forward_data = json.loads(forward_info) if forward_info else None
+    if forward_data:
+        msg += f"\n📤 <b>Переслано от:</b> {escape(forward_data['sender_name'])}"
+
+    if media_type != "text" and file_id:
+        await _send_media_with_fallback(bot, recipient_id, media_type, media_val, msg, original_file_id=file_id)
+    else:
+        await safe_send(bot, recipient_id, msg, parse_mode='html')
 
 
 @router.business_connection()
@@ -1121,10 +1129,13 @@ async def process_startup_digest(bot: Bot):
             media_type = item["media_type"]
             media_name = MEDIA_NAMES.get(media_type, "сообщение")
             
+            forward_data = json.loads(item["forward_info"]) if item.get("forward_info") else None
+            forward_part = f"\n📤 <b>Переслано от:</b> {escape(forward_data['sender_name'])}" if forward_data else ""
+            
             if item["type"] == "delete":
                 if media_type == "text":
                     text_lines.append(
-                        f"🗑 <b>Удалено сообщение</b> от {user_display} (ID: <code>{user_id}</code>) в {timestamp}:\n"
+                        f"🗑 <b>Удалено сообщение</b> от {user_display} (ID: <code>{user_id}</code>) в {timestamp}:{forward_part}\n"
                         f"<blockquote>{safe_escape(item['old_text'])}</blockquote>"
                     )
                 else:
@@ -1132,20 +1143,20 @@ async def process_startup_digest(bot: Bot):
                     if item.get("old_text") and item["old_text"] != "<i>(без описания/текста)</i>":
                         caption_part = f"\n<blockquote>Описание: {escape(item['old_text'])}</blockquote>"
                     text_lines.append(
-                        f"🗑 <b>Удалено {media_name}</b> от {user_display} (ID: <code>{user_id}</code>) в {timestamp}{caption_part}"
+                        f"🗑 <b>Удалено {media_name}</b> от {user_display} (ID: <code>{user_id}</code>) в {timestamp}{forward_part}{caption_part}"
                     )
                     if item.get("file_id"):
                         media_items.append(item)
             elif item["type"] == "edit":
                 if media_type == "text":
                     text_lines.append(
-                        f"📝 <b>Изменено сообщение</b> от {user_display} (ID: <code>{user_id}</code>) в {timestamp}:\n"
+                        f"📝 <b>Изменено сообщение</b> от {user_display} (ID: <code>{user_id}</code>) в {timestamp}:{forward_part}\n"
                         f"<b>Было:</b> <blockquote>{safe_escape(item['old_text'])}</blockquote>\n"
                         f"<b>Стало:</b> <blockquote>{safe_escape(item['new_text'])}</blockquote>"
                     )
                 else:
                     text_lines.append(
-                        f"📝 <b>Изменено описание {media_name}</b> от {user_display} (ID: <code>{user_id}</code>) в {timestamp}:\n"
+                        f"📝 <b>Изменено описание {media_name}</b> от {user_display} (ID: <code>{user_id}</code>) в {timestamp}:{forward_part}\n"
                         f"<b>Было:</b> <blockquote>{safe_escape(item['old_text'])}</blockquote>\n"
                         f"<b>Стало:</b> <blockquote>{safe_escape(item['new_text'])}</blockquote>"
                     )
@@ -1305,7 +1316,8 @@ async def edited_business_message(message: types.Message):
                     "media_type": user_msg.media_type,
                     "file_id": user_msg.file_id,
                     "old_text": user_msg.message_text,
-                    "new_text": message.text or message.caption or ""
+                    "new_text": message.text or message.caption or "",
+                    "forward_info": user_msg.forward_info
                 })
             else:
                 await send_msg(
@@ -1318,7 +1330,8 @@ async def edited_business_message(message: types.Message):
                     username=message.from_user.username,
                     media_type=user_msg.media_type,
                     file_id=user_msg.file_id,
-                    bot=message.bot
+                    bot=message.bot,
+                    forward_info=user_msg.forward_info
                 )
             await MessageStore.update(user_id=message.from_user.id, message_id=message.message_id, message_text=message.text or message.caption)
 
@@ -1355,7 +1368,8 @@ async def deleted_business_messages(event: types.BusinessMessagesDeleted, bot: B
                         "timestamp": timestamp_formatted,
                         "media_type": user_msg.media_type,
                         "file_id": user_msg.file_id,
-                        "old_text": user_msg.message_text
+                        "old_text": user_msg.message_text,
+                        "forward_info": user_msg.forward_info
                     })
                 else:
                     await send_msg(
@@ -1368,7 +1382,8 @@ async def deleted_business_messages(event: types.BusinessMessagesDeleted, bot: B
                         username=username,
                         media_type=user_msg.media_type,
                         file_id=user_msg.file_id,
-                        bot=bot
+                        bot=bot,
+                        forward_info=user_msg.forward_info
                     )
                     if user_msg.file_id:
                         downloads_dir = os.path.join(BASE_DIR, "downloads")
@@ -1529,13 +1544,33 @@ async def business_message(message: types.Message):
         message_datetime_utc = message.date.replace(tzinfo=timezone.utc)
         timestamp_iso = message_datetime_utc.isoformat()
         
+        forward_info = None
+        if message.forward_origin:
+            origin = message.forward_origin
+            if origin.type == "user":
+                name = origin.sender_user.full_name
+            elif origin.type == "hidden_user":
+                name = origin.sender_user_name
+            elif origin.type == "chat":
+                name = origin.sender_chat.title
+            elif origin.type == "channel":
+                name = f"{origin.chat.title} (канал)"
+            else:
+                name = "Неизвестный источник"
+                
+            forward_info = {
+                "sender_name": name,
+                "date": origin.date.isoformat() if hasattr(origin, "date") else None
+            }
+            
         await MessageStore.add(
             user_id=user_id,
             message_id=message.message_id,
             message_text=message_text,
             timestamp=timestamp_iso,
             media_type=media_type,
-            file_id=file_id
+            file_id=file_id,
+            forward_info=json.dumps(forward_info) if forward_info else None
         )
 
 
